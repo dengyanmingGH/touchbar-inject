@@ -111,14 +111,23 @@ Touch Bar 使用 OLED 屏，较低亮度可减缓像素衰减（烧屏）。TBBa
 
 ## 目录结构
 
+**仓库内源码：**
+
 ```
 touchbar-inject/
 ├── TBBar.swift            # Swift 主程序
-├── tbbridge.m            # ObjC 桥接（私有 API + 亮度工具）
-├── touchbar_inject.py    # 构建 & 安装脚本
-├── TBBar.app/            # 编译产物（symlink → /Applications/TBBar.app）
-├── tbbridge.o            # 编译中间产物
-└── tbbar.log             # 历史日志（运行时实际写到 ~/.tbbar/tbbar.log）
+├── tbbridge.m             # ObjC 桥接（私有 API + 亮度工具）
+├── touchbar_inject.py     # 构建 & 安装脚本
+├── README.md
+└── .gitignore
+```
+
+**构建后生成（已在 .gitignore 中忽略）：**
+
+```
+├── TBBar.app/             # 编译产物（默认输出到项目目录，也可软链到 /Applications）
+├── tbbridge.o             # 编译中间产物
+└── tbbar.log              # 历史日志（运行时实际写到 ~/.tbbar/tbbar.log）
 ```
 
 ---
