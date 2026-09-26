@@ -1,0 +1,6 @@
+# 编译产物
+TBBar.app
+tbbridge.o
+
+# 日志与本地配置
+*.log
