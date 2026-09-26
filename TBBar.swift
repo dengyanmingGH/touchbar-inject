@@ -69,17 +69,7 @@ func saveBrightness(_ v: Int) {
 
 var gBrightness: Int = 50   // 默认 50%（偏暗）
 
-// 把一张 SF Symbol 图像按亮度降为：对每个像素通道做 value = value × brightness
-//   （缩放而非"叠黑"，保持色相 HSB.H/S 不变，只调亮度 V）
-//   brightness = 100 → 原图；50 → 亮度减半；0 → 全黑
-//   图标与按钮色块使用同一系数，保证明暗一致。
-// 把一张 SF Symbol 图像按亮度缩放（委托 ObjC bridge 做像素级 RGB×factor，
-// 保持 alpha 与色相；factor = brightness/100）
-func dimmed(_ image: NSImage, _ brightness: Int) -> NSImage {
-    let f = Float(brightness) / 100.0
-    return TB_dimImage(image, f)
-}
-
+// 把一张 SF Symbol 图像按亮度缩放 -> 已由 ObjC 侧 TB_buildItemImage 统一处理，见下。
 // 把按钮底色（bezelColor）按亮度调整：保留色相 H、饱和度 S，把 HSB 的 V × factor
 // 在深色 Touch Bar 上得到"可控明暗的彩色块"，与图标使用同一系数，明暗一致。
 func dimmed(_ color: NSColor, _ brightness: Int) -> NSColor {
@@ -141,12 +131,14 @@ func TB_presentSystemModalTouchBar(_ tb: NSTouchBar, _ trayItemIdentifier: NSStr
 @_silgen_name("TB_dismissSystemModalTouchBar")
 func TB_dismissSystemModalTouchBar(_ tb: NSTouchBar)
 
-// ObjC bridge：像素级亮度工具（TB_dimImage / TB_dimColor 实现在 tbbridge.m）
-@_silgen_name("TB_dimImage")
-func TB_dimImage(_ image: NSImage, _ factor: Float) -> NSImage
-
+// ObjC bridge：颜色亮度工具（TB_dimColor 实现在 tbbridge.m）
 @_silgen_name("TB_dimColor")
 func TB_dimColor(_ color: NSColor, _ factor: Float) -> NSColor
+
+// ObjC bridge：合成「彩色圆角背景 + 白色图标」并按 factor 缩放亮度（实现在 tbbridge.m）
+// 用 NSBitmapImageRep 自持缓冲，避免 Swift 侧传外部指针再释放导致的 EXC_BAD_ACCESS
+@_silgen_name("TB_buildItemImage")
+func TB_buildItemImage(_ symbol: NSString, _ tint: NSColor, _ factor: Float, _ label: NSString) -> NSImage
 
 enum SystemModalTouchBar {
     static var available: Bool { TB_systemModalTouchBarAvailable() }
@@ -171,7 +163,12 @@ enum SystemModalTouchBar {
 // ---------------------------------------------------------------------------
 final class TBApp: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     var touchBar: NSTouchBar?
-    var itemCache: [String: NSButtonTouchBarItem] = [:]   // key = identifier#brightness
+    // 当前 bar 的 item（按 identifier 去重）。每次重建换新 bar → 这里清空、用全新 item：
+    // NSTouchBarItem 不能被多个 NSTouchBar 共享，复用会导致释放时过度释放崩溃。
+    var barItemCache: [String: NSButtonTouchBarItem] = [:]
+    // 保活所有创建过的 item：system-modal 层可能仍持有旧 bar/item 的引用，
+    // 过早释放旧 item 会触发 EXC_BAD_ACCESS（objc_release 野指针）。
+    var liveItems: [NSButtonTouchBarItem] = []
     var statusItem: NSStatusItem?
     var usingSystemModal = false
 
@@ -223,12 +220,20 @@ final class TBApp: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     }
 
     // MARK: - 构造 Touch Bar
-    func buildTouchBar() {
+    // 每次需要刷新时都新建一个 NSTouchBar 实例：系统对已 present 的同一个实例
+    // 会直接复用缓存 item，不再回调 makeItemForIdentifier（这正是"改了亮度界面不变"
+    // 的根因）。换新实例才会重新向 delegate 取 item。
+    @discardableResult
+    func makeTouchBarInstance() -> NSTouchBar {
         let tb = NSTouchBar()
         tb.delegate = self
         tb.defaultItemIdentifiers = [.flexibleSpace] + (0..<buttons.count).map(itemIdentifier) + [.flexibleSpace]
         tb.customizationAllowedItemIdentifiers = (0..<buttons.count).map(itemIdentifier)
-        self.touchBar = tb
+        return tb
+    }
+
+    func buildTouchBar() {
+        self.touchBar = makeTouchBarInstance()
     }
 
     // MARK: - 系统模态呈现
@@ -371,6 +376,28 @@ final class TBApp: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         launch(buttons[idx])
     }
 
+    // MARK: - 构建"彩色背景 + dim 图标"的合成图像
+    // 因 NSButtonTouchBarItem.bezelColor 在 macOS 14+ system-modal 渲染里被忽略，
+    // 改为直接把"彩色背景 + dim 图标"烘成一张 NSImage 作为 item.image，
+    // 亮度变化时背景明暗差异才真正体现在物理 Touch Bar 上。
+    // 合成逻辑放在 ObjC bridge（TB_buildItemImage）：由 NSBitmapImageRep 自持像素缓冲，
+    // 规避 Swift 侧传外部指针再释放造成的 use-after-free（TouchBarServer 异步渲染时崩）。
+    func buildItemImage(for b: TBButton, brightness: Int) -> NSImage {
+        let f = Float(brightness) / 100.0
+        let out = TB_buildItemImage(b.symbol as NSString, b.tint, f, b.label as NSString)
+
+        // 验证钩子：TB_DUMP_IMGS=1 时把每个亮度的 item 图像落盘为 PNG
+        if ProcessInfo.processInfo.environment["TB_DUMP_IMGS"] != nil {
+            if let tiff = out.tiffRepresentation,
+               let rep2 = NSBitmapImageRep(data: tiff),
+               let png = rep2.representation(using: .png, properties: [:]) {
+                let fn = "/tmp/tbimg_\(b.label)_\(brightness)pct.png"
+                try? png.write(to: URL(fileURLWithPath: fn))
+            }
+        }
+        return out
+    }
+
     func applicationWillTerminate(_ note: Notification) {
         if let tb = touchBar, usingSystemModal {
             SystemModalTouchBar.dismiss(tb)
@@ -385,45 +412,42 @@ extension TBApp {
             return nil
         }
         let b = buttons[idx]
-        let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
-        let rawImg = NSImage(systemSymbolName: b.symbol, accessibilityDescription: b.label)?
-            .withSymbolConfiguration(cfg)
-        let img: NSImage = (rawImg.map { dimmed($0, gBrightness) }) ?? NSImage()
-        let bezel = dimmed(b.tint, gBrightness)
+        // 同一个 bar 内按 identifier 去重（系统可能对同一 identifier 回调多次）
+        if let cached = barItemCache[identifier.rawValue] { return cached }
 
-        // 缓存 key 带上当前亮度：亮度一变 → 缓存必然 miss → 返回**新建** item。
-        // 这既保证"换亮度=换新 item 重绘"，又避免手动 release / 原地改属性
-        // 触碰 system-modal 层已接管的旧 item（二者都会导致 EXC_BAD_ACCESS）。
-        let cacheKey = "\(identifier.rawValue)#\(gBrightness)"
-        if let cached = itemCache[cacheKey] { return cached }
-
+        // 合成"彩色背景 + dim 图标"的完整图像（bezelColor 在 system-modal 下被忽略，
+        // 必须把背景烘进 image 里，亮度差异才真正体现在物理 Touch Bar 上）
+        let img = buildItemImage(for: b, brightness: gBrightness)
         let item = NSButtonTouchBarItem(identifier: identifier,
                                         title: b.label,
                                         image: img,
                                         target: self,
                                         action: #selector(onTouchBarTap(_:)))
-        item.bezelColor = bezel
+        item.bezelColor = dimmed(b.tint, gBrightness)   // 保留（App 级 Touch Bar 兜底场景下仍生效）
         item.customizationLabel = b.label
-        itemCache[cacheKey] = item
+        barItemCache[identifier.rawValue] = item
+        liveItems.append(item)   // 保活，防止旧 bar 释放时 item 被连带释放（野指针崩溃）
         return item
     }
 
     // MARK: - 重建 Touch Bar 按钮（亮度变化后调用）
-    // 正确做法：不手动释放旧 item、也不原地改属性（系统已接管）。
-    // 只做 dismiss + present，让系统模态层重新向 delegate 拉取；
-    // 由于 makeItemForIdentifier 的缓存 key 含亮度，亮度变化后必然 miss，
-    // 自动返回按新亮度生成的新 item，旧 item 由系统在 present 切换时释放。
+    // 关键：**新建** NSTouchBar 实例并 present，系统才会重新回调
+    // makeItemForIdentifier 取到按新亮度生成的 item（同一个实例会被缓存复用，
+    // 换了亮度也不刷新 —— 曾导致"10% 与 100% 没差别"）。
+    // 不手动释放旧 item、不原地改属性：旧 bar 与旧 item 由系统 + itemCache 托管，
+    // 避免触碰已交给 system-modal 层的对象（会 EXC_BAD_ACCESS）。
     func rebuildTouchBarItems() {
-        guard let tb = touchBar else { return }
+        guard let old = touchBar else { return }
+        barItemCache = [:]        // 新 bar 用全新 item；旧 item 已在 liveItems 中保活
+        let tb = makeTouchBarInstance()
+        self.touchBar = tb
         if usingSystemModal {
-            SystemModalTouchBar.dismiss(tb)
+            SystemModalTouchBar.dismiss(old)
             SystemModalTouchBar.present(tb)
         } else {
-            // App 级 Touch Bar：改 defaultItemIdentifiers 顺序强制重取
-            let ids = (0..<buttons.count).map(itemIdentifier)
-            tb.defaultItemIdentifiers = [.flexibleSpace] + ids + [.flexibleSpace]
+            NSApp.touchBar = tb
         }
-        tbLog("rebuildTouchBarItems @\(gBrightness)% 已请求重取")
+        tbLog("rebuildTouchBarItems @\(gBrightness)% 已用新 NSTouchBar 重建")
     }
 }
 
