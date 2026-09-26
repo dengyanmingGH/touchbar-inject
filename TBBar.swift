@@ -40,7 +40,7 @@ func tbLog(_ msg: String) {
 }
 
 // ---------------------------------------------------------------------------
-// 亮度控制（0~100，默认 75 偏暗，降低 OLED 电流 / 减缓烧屏）
+// 亮度控制（0~100，默认 50，降低 OLED 电流 / 减缓烧屏）
 //   持久化到 ~/.tbbar/config.json；菜单可实时调节并即时生效
 // ---------------------------------------------------------------------------
 let CONFIG_DIR: String = LOG_DIR
@@ -55,7 +55,7 @@ func loadBrightness() -> Int {
             return min(100, max(0, v))
         }
     }
-    return 75
+    return 50
 }
 
 func saveBrightness(_ v: Int) {
@@ -67,7 +67,7 @@ func saveBrightness(_ v: Int) {
     tbLog("brightness -> \(v)%")
 }
 
-var gBrightness: Int = 75   // 默认 75%（偏暗）
+var gBrightness: Int = 50   // 默认 50%（偏暗）
 
 // 把一张 SF Symbol 图像按亮度降为：对每个像素通道做 value = value × brightness
 //   （缩放而非"叠黑"，保持色相 HSB.H/S 不变，只调亮度 V）
@@ -171,7 +171,7 @@ enum SystemModalTouchBar {
 // ---------------------------------------------------------------------------
 final class TBApp: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
     var touchBar: NSTouchBar?
-    var itemCache: [NSTouchBarItem.Identifier: NSButtonTouchBarItem] = [:]
+    var itemCache: [String: NSButtonTouchBarItem] = [:]   // key = identifier#brightness
     var statusItem: NSStatusItem?
     var usingSystemModal = false
 
@@ -187,6 +187,30 @@ final class TBApp: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         // 稍等一下，确保 TouchBarServer 已就绪
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
             self?.present()
+        }
+
+        // 自检钩子（可选）：若存在 ~/.tbbar/selftest，启动后自动按
+        // 100/75/50/30/30/100 顺序跑一轮 rebuildTouchBarItems，验证低亮度
+        // 不再崩溃；结果写入 ~/.tbbar/selftest.result（供外部校验）。
+        let stPath = (CONFIG_DIR as NSString).appendingPathComponent("selftest")
+        if FileManager.default.fileExists(atPath: stPath) {
+            tbLog("selftest 触发：按 100/75/50/30/30/100 顺序重建")
+            let seq: [Int] = [100, 75, 50, 30, 30, 100]
+            let resPath = (CONFIG_DIR as NSString).appendingPathComponent("selftest.result")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                guard let self = self else { return }
+                var log = "OK start\n"
+                for v in seq {
+                    gBrightness = v
+                    self.rebuildTouchBarItems()
+                    log += "OK \(v)%\n"
+                    tbLog("selftest @\(v)% 成功")
+                    Thread.sleep(forTimeInterval: 0.3)
+                }
+                log += "DONE\n"
+                try? log.write(toFile: resPath, atomically: true, encoding: .utf8)
+                tbLog("selftest 完成，结果已写入 selftest.result")
+            }
         }
 
         // 诊断模式（TB_DEBUG_VIS=1）：每 3 秒记录一次可见性与当前前台 App
@@ -242,8 +266,8 @@ final class TBApp: NSObject, NSApplicationDelegate, NSTouchBarDelegate {
         let brightItem = NSMenuItem(title: "亮度（Touch Bar 图标）", action: nil, keyEquivalent: "")
         let brightMenu = NSMenu()
         brightMenu.title = "亮度"
-        // 预设档位（50% 最暗 / 75% 适中 / 100% 全亮）+ 自定义输入
-        let presets: [(Int, String)] = [(50, "50% 最暗"), (75, "75% 适中"), (100, "100% 全亮")]
+        // 预设档位（50% 默认 / 75% 适中 / 100% 全亮）+ 自定义输入
+        let presets: [(Int, String)] = [(50, "50% 默认"), (75, "75% 适中"), (100, "100% 全亮")]
         for (v, title) in presets {
             let mi = NSMenuItem(title: title, action: #selector(onSetBrightness(_:)), keyEquivalent: "")
             mi.target = self
@@ -360,42 +384,46 @@ extension TBApp {
         guard let idx = (0..<buttons.count).first(where: { itemIdentifier($0) == identifier }) else {
             return nil
         }
-        if let cached = itemCache[identifier] { return cached }
         let b = buttons[idx]
-
         let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .medium)
-        // 按全局亮度把图标"调暗"（保持色相，叠半透明黑）
         let rawImg = NSImage(systemSymbolName: b.symbol, accessibilityDescription: b.label)?
             .withSymbolConfiguration(cfg)
-        let img: NSImage? = rawImg.map { dimmed($0, gBrightness) }
+        let img: NSImage = (rawImg.map { dimmed($0, gBrightness) }) ?? NSImage()
+        let bezel = dimmed(b.tint, gBrightness)
+
+        // 缓存 key 带上当前亮度：亮度一变 → 缓存必然 miss → 返回**新建** item。
+        // 这既保证"换亮度=换新 item 重绘"，又避免手动 release / 原地改属性
+        // 触碰 system-modal 层已接管的旧 item（二者都会导致 EXC_BAD_ACCESS）。
+        let cacheKey = "\(identifier.rawValue)#\(gBrightness)"
+        if let cached = itemCache[cacheKey] { return cached }
 
         let item = NSButtonTouchBarItem(identifier: identifier,
                                         title: b.label,
-                                        image: img ?? NSImage(),
+                                        image: img,
                                         target: self,
                                         action: #selector(onTouchBarTap(_:)))
-        item.bezelColor = dimmed(b.tint, gBrightness)   // 按钮底色同步调暗
+        item.bezelColor = bezel
         item.customizationLabel = b.label
-        itemCache[identifier] = item
+        itemCache[cacheKey] = item
         return item
     }
 
     // MARK: - 重建 Touch Bar 按钮（亮度变化后调用）
+    // 正确做法：不手动释放旧 item、也不原地改属性（系统已接管）。
+    // 只做 dismiss + present，让系统模态层重新向 delegate 拉取；
+    // 由于 makeItemForIdentifier 的缓存 key 含亮度，亮度变化后必然 miss，
+    // 自动返回按新亮度生成的新 item，旧 item 由系统在 present 切换时释放。
     func rebuildTouchBarItems() {
-        // 清空缓存，下次 makeItemForIdentifier 时按新亮度重建
-        itemCache.removeAll()
         guard let tb = touchBar else { return }
-        // 触发系统重新拉取每个 item（强制重取）
-        let ids = (0..<buttons.count).map(itemIdentifier)
-        for id in ids {
-            _ = self.touchBar(tb, makeItemForIdentifier: id)
-        }
-        // 重新 present 一次，让系统模态 Touch Bar 重绘
         if usingSystemModal {
             SystemModalTouchBar.dismiss(tb)
             SystemModalTouchBar.present(tb)
+        } else {
+            // App 级 Touch Bar：改 defaultItemIdentifiers 顺序强制重取
+            let ids = (0..<buttons.count).map(itemIdentifier)
+            tb.defaultItemIdentifiers = [.flexibleSpace] + ids + [.flexibleSpace]
         }
-        tbLog("rebuildTouchBarItems @\(gBrightness)%")
+        tbLog("rebuildTouchBarItems @\(gBrightness)% 已请求重取")
     }
 }
 
